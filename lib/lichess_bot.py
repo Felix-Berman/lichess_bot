@@ -357,6 +357,8 @@ def lichess_bot_main(li: lichess.Lichess,
 
     last_check_online_time = Timer(hours(1))
     matchmaker = matchmaking.Matchmaking(li, config, user_profile)
+    slots = matchmaking.MatchmakingSlots(max_games)
+    matchmaker.set_slots(slots)
     matchmaker.show_earliest_challenge_time()
 
     play_game_args = PlayGameArgsType(li=li, control_queue=control_queue, user_profile=user_profile,
@@ -367,6 +369,15 @@ def lichess_bot_main(li: lichess.Lichess,
     recent_bot_challenges: defaultdict[str, list[Timer]] = defaultdict(list)
 
     online_block_list = OnlineBlocklist(config.challenge.online_block_list)
+
+    if slots.enabled:
+        for game in all_games:
+            game_id = game["gameId"]
+            if game_id not in active_games:
+                continue
+            speed = game.get("speed", "rapid")
+            is_bot = game_is_bot_opponent(li, game)
+            slots.reserve_game(game_id, is_bot, speed)
 
     if config.quit_after_all_games_finish:
         logger.info("When quitting, lichess-bot will first wait for all running games to finish.")
@@ -386,6 +397,7 @@ def lichess_bot_main(li: lichess.Lichess,
 
             if event["type"] == "local_game_done":
                 active_games.discard(event["game"]["id"])
+                slots.release(event["game"]["id"])
                 matchmaker.game_done()
                 log_proc_count("Freed", active_games)
                 one_game_completed = True
@@ -401,6 +413,7 @@ def lichess_bot_main(li: lichess.Lichess,
                 matchmaker.declined_challenge(event)
             elif event["type"] == "challengeCanceled":
                 active_games.discard(event["challenge"]["id"])
+                slots.release(event["challenge"]["id"])
                 log_proc_count("Freed", active_games)
             elif event["type"] == "gameStart":
                 matchmaker.accepted_challenge(event)
@@ -421,7 +434,7 @@ def lichess_bot_main(li: lichess.Lichess,
                                              play_game_args,
                                              active_games,
                                              max_games)
-            accept_challenges(li, challenge_queue, active_games, max_games)
+            accept_challenges(li, challenge_queue, active_games, max_games, slots)
             matchmaker.challenge(active_games, challenge_queue, max_games)
             check_online_status(li, user_profile, last_check_online_time)
 
@@ -497,11 +510,35 @@ def start_low_time_games(low_time_games: list[GameType], active_games: set[str],
         start_game_thread(active_games, game_id, play_game_args, pool)
 
 
-def accept_challenges(li: lichess.Lichess, challenge_queue: MULTIPROCESSING_LIST_TYPE, active_games: set[str],
-                      max_games: int) -> None:
+def accept_challenges(li: lichess.Lichess,
+                      challenge_queue: MULTIPROCESSING_LIST_TYPE,
+                      active_games: set[str],
+                      max_games: int,
+                      slots: matchmaking.MatchmakingSlots) -> None:
     """Accept a challenge."""
-    while len(active_games) < max_games and challenge_queue:
-        chlng = challenge_queue.pop(0)
+    def can_accept_now(challenge: model.Challenge) -> bool:
+        if slots.enabled:
+            return slots.can_accept_challenge(challenge, active_games)
+        return len(active_games) < max_games
+
+    while challenge_queue:
+        if slots.enabled and slots.used_slots(active_games) >= max_games:
+            break
+        if not slots.enabled and len(active_games) >= max_games:
+            break
+
+        human_challenge_index = next((index
+                                      for index, challenge in enumerate(challenge_queue)
+                                      if not challenge.challenger.is_bot and can_accept_now(challenge)), None)
+        next_challenge_index = human_challenge_index
+        if next_challenge_index is None:
+            next_challenge_index = next((index
+                                         for index, challenge in enumerate(challenge_queue)
+                                         if challenge.challenger.is_bot and can_accept_now(challenge)), None)
+        if next_challenge_index is None:
+            break
+
+        chlng = challenge_queue.pop(next_challenge_index)
         if chlng.from_self:
             continue
 
@@ -509,6 +546,7 @@ def accept_challenges(li: lichess.Lichess, challenge_queue: MULTIPROCESSING_LIST
             logger.info(f"Accept {chlng}")
             li.accept_challenge(chlng.id)
             active_games.add(chlng.id)
+            slots.reserve_game(chlng.id, chlng.challenger.is_bot, chlng.speed)
             log_proc_count("Queued", active_games)
         except (HTTPError, ReadTimeout) as exception:
             if isinstance(exception, HTTPError) and exception.response is not None and exception.response.status_code == 404:
@@ -541,6 +579,22 @@ def sort_challenges(challenge_queue: MULTIPROCESSING_LIST_TYPE, challenge_config
     if challenge_config.preference != "none":
         challenge_list.sort(key=lambda challenger: challenger.challenger.is_bot, reverse=challenge_config.preference == "bot")
     challenge_queue[:] = challenge_list
+
+
+def game_is_bot_opponent(li: lichess.Lichess, game: GameType) -> bool:
+    """Determine whether the opponent in a game is a bot."""
+    opponent = game.get("opponent", {})
+    title = opponent.get("title")
+    if title is not None:
+        return title == "BOT"
+
+    opponent_username = opponent.get("username")
+    if not opponent_username:
+        return True
+
+    with contextlib.suppress(Exception):
+        return li.get_public_data(opponent_username).get("title") == "BOT"
+    return True
 
 
 def game_is_active(li: lichess.Lichess, game_id: str) -> bool:

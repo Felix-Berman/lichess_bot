@@ -1,6 +1,6 @@
 """Test functions for matchmaking module."""
 from unittest.mock import Mock
-from lib.matchmaking import game_category, Matchmaking
+from lib.matchmaking import game_category, Matchmaking, MatchmakingSlots, configured_time_controls
 from lib.config import Configuration
 from lib.lichess_types import UserProfileType
 
@@ -224,3 +224,52 @@ def test_get_random_config_value__returns_from_choices_when_random() -> None:
     result = matchmaking.get_random_config_value(test_config, "challenge_mode", choices)
 
     assert result in choices, f"Expected result to be in {choices} but got '{result}'"
+
+
+def test_configured_time_controls__treats_correspondence_as_a_normal_control() -> None:
+    """Test that correspondence is sampled from the same time-control pool as real-time controls."""
+    match_config = Configuration({
+        "challenge_initial_time": [180, 300],
+        "challenge_increment": [2, 0],
+        "challenge_days": [1]
+    })
+
+    controls = configured_time_controls(match_config)
+    expected = {(180, 2, 0), (180, 0, 0), (300, 2, 0), (300, 0, 0), (0, 0, 1)}
+
+    assert len(controls) == 5
+    assert set(controls) == expected
+
+
+def test_configured_time_controls__filters_by_slot_lane() -> None:
+    """Test filtering controls for short-vs-long matchmaking slots."""
+    match_config = Configuration({
+        "challenge_initial_time": [60, 600],
+        "challenge_increment": [0],
+        "challenge_days": [1]
+    })
+
+    short_controls = configured_time_controls(match_config, {"short"})
+    long_controls = configured_time_controls(match_config, {"long"})
+
+    assert short_controls == [(60, 0, 0)]
+    assert set(long_controls) == {(600, 0, 0), (0, 0, 1)}
+
+
+def test_matchmaking_slots__enforces_two_bot_lanes_when_concurrency_is_three() -> None:
+    """Test that with concurrency=3 we only allow one short and one long bot lane."""
+    slots = MatchmakingSlots(3)
+    active_games: set[str] = set()
+
+    assert slots.available_bot_lanes(active_games) == {"short", "long"}
+
+    slots.reserve_outgoing_challenge("short_pending", "blitz")
+    assert slots.can_accept_bot_speed("blitz", active_games) is False
+    assert slots.can_accept_bot_speed("rapid", active_games) is True
+
+    slots.reserve_outgoing_challenge("long_pending", "rapid")
+    assert slots.can_accept_bot_speed("rapid", active_games) is False
+    assert slots.can_accept_human(active_games) is True
+
+    active_games.add("human_game")
+    assert slots.can_accept_human(active_games) is False

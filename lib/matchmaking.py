@@ -3,6 +3,7 @@ import random
 import logging
 import datetime
 import contextlib
+from dataclasses import dataclass, field
 from lib import model
 from lib.timer import Timer, days, seconds, minutes, years
 from collections import defaultdict
@@ -15,6 +16,148 @@ from lib.lichess_types import UserProfileType, PerfType, EventType, FilterType, 
 MULTIPROCESSING_LIST_TYPE: TypeAlias = Sequence[model.Challenge]
 
 logger = logging.getLogger(__name__)
+
+BOT_SHORT_SPEEDS = {"ultraBullet", "bullet", "blitz"}
+BOT_LONG_SPEEDS = {"rapid", "classical", "correspondence"}
+
+
+def bot_lane_for_speed(speed: str) -> str:
+    """Classify a bot game speed as either short or long."""
+    return "short" if speed in BOT_SHORT_SPEEDS else "long"
+
+
+def configured_time_controls(match_config: Configuration,
+                             allowed_bot_lanes: set[str] | None = None) -> list[tuple[int, int, int]]:
+    """Get all configured time controls as (base_time, increment, days)."""
+    challenge_initial_time: list[int | None] = list(match_config.challenge_initial_time or [None])
+    challenge_increment: list[int | None] = list(match_config.challenge_increment or [None])
+    challenge_days: list[int | None] = list(match_config.challenge_days or [])
+    challenge_initial_time = challenge_initial_time or [None]
+    challenge_increment = challenge_increment or [None]
+
+    time_controls: list[tuple[int, int, int]] = []
+    for base in challenge_initial_time:
+        for increment in challenge_increment:
+            base_time = int(base or 0)
+            inc_time = int(increment or 0)
+            if not (base_time or inc_time):
+                continue
+            speed = game_category("standard", base_time, inc_time, 0)
+            if allowed_bot_lanes is None or bot_lane_for_speed(speed) in allowed_bot_lanes:
+                time_controls.append((base_time, inc_time, 0))
+
+    for num_days_cfg in challenge_days:
+        num_days = int(num_days_cfg or 0)
+        if not num_days:
+            continue
+        if allowed_bot_lanes is None or "long" in allowed_bot_lanes:
+            time_controls.append((0, 0, num_days))
+
+    return time_controls
+
+
+@dataclass
+class MatchmakingSlots:
+    """Track lane reservations for outgoing/incoming challenges and active games."""
+    max_games: int
+    enabled: bool = field(init=False)
+    slot_by_game_id: dict[str, str] = field(init=False, default_factory=dict)
+    pending_outgoing_challenges: set[str] = field(init=False, default_factory=set)
+
+    def __post_init__(self) -> None:
+        self.enabled = self.max_games == 3
+
+    def _slot_for_game(self, is_bot_game: bool, speed: str) -> str:
+        if not self.enabled:
+            return "any"
+        if not is_bot_game:
+            return "human"
+        return f"bot_{bot_lane_for_speed(speed)}"
+
+    def reserve_game(self, game_id: str, is_bot_game: bool, speed: str) -> None:
+        """Reserve a lane for a game or accepted challenge."""
+        if not self.enabled:
+            return
+        self.slot_by_game_id[game_id] = self._slot_for_game(is_bot_game, speed)
+        self.pending_outgoing_challenges.discard(game_id)
+
+    def reserve_outgoing_challenge(self, challenge_id: str, speed: str) -> None:
+        """Reserve a lane for an outgoing challenge until it is accepted/declined/cancelled."""
+        if not self.enabled:
+            return
+        self.slot_by_game_id[challenge_id] = self._slot_for_game(True, speed)
+        self.pending_outgoing_challenges.add(challenge_id)
+
+    def confirm_game_start(self, game_id: str) -> None:
+        """Convert a pending outgoing challenge reservation into an active game reservation."""
+        if not self.enabled:
+            return
+        self.pending_outgoing_challenges.discard(game_id)
+
+    def release(self, game_or_challenge_id: str) -> None:
+        """Free a lane when a game ends or a challenge does not lead to a game."""
+        if not self.enabled:
+            return
+        self.pending_outgoing_challenges.discard(game_or_challenge_id)
+        self.slot_by_game_id.pop(game_or_challenge_id, None)
+
+    def has_reservation(self, game_id: str) -> bool:
+        """Whether a game/challenge currently has a tracked reservation."""
+        if not self.enabled:
+            return False
+        return game_id in self.slot_by_game_id
+
+    def used_slots(self, active_games: set[str]) -> int:
+        """Count used slots, including outgoing challenges that are still pending."""
+        if not self.enabled:
+            return len(active_games)
+        pending = sum(1 for challenge_id in self.pending_outgoing_challenges if challenge_id not in active_games)
+        return len(active_games) + pending
+
+    def _bot_lane_counts(self) -> tuple[int, int]:
+        if not self.enabled:
+            return 0, 0
+        short_count = sum(1 for slot in self.slot_by_game_id.values() if slot == "bot_short")
+        long_count = sum(1 for slot in self.slot_by_game_id.values() if slot == "bot_long")
+        return short_count, long_count
+
+    def can_accept_human(self, active_games: set[str]) -> bool:
+        """Whether a human challenge can be accepted now."""
+        return self.used_slots(active_games) < self.max_games
+
+    def can_accept_bot_speed(self, speed: str, active_games: set[str]) -> bool:
+        """Whether a bot challenge with this speed can be accepted now."""
+        if self.used_slots(active_games) >= self.max_games:
+            return False
+        if not self.enabled:
+            return True
+        short_count, long_count = self._bot_lane_counts()
+        if short_count + long_count >= 2:
+            return False
+        lane = bot_lane_for_speed(speed)
+        return (lane == "short" and short_count == 0) or (lane == "long" and long_count == 0)
+
+    def can_accept_challenge(self, challenge: model.Challenge, active_games: set[str]) -> bool:
+        """Whether an incoming challenge fits the slot policy."""
+        if challenge.challenger.is_bot:
+            return self.can_accept_bot_speed(challenge.speed, active_games)
+        return self.can_accept_human(active_games)
+
+    def available_bot_lanes(self, active_games: set[str]) -> set[str]:
+        """Return the bot lanes currently available for outgoing matchmaking."""
+        if self.used_slots(active_games) >= self.max_games:
+            return set()
+        if not self.enabled:
+            return {"short", "long"}
+        short_count, long_count = self._bot_lane_counts()
+        if short_count + long_count >= 2:
+            return set()
+        available_lanes: set[str] = set()
+        if short_count == 0:
+            available_lanes.add("short")
+        if long_count == 0:
+            available_lanes.add("long")
+        return available_lanes
 
 
 class Matchmaking:
@@ -49,6 +192,11 @@ class Matchmaking:
             self.add_to_block_list(name)
 
         self.online_block_list = OnlineBlocklist(self.matchmaking_cfg.online_block_list)
+        self.slots: MatchmakingSlots | None = None
+
+    def set_slots(self, slots: MatchmakingSlots) -> None:
+        """Attach the shared slot tracker used by matchmaking and challenge acceptance."""
+        self.slots = slots
 
     def should_create_challenge(self) -> bool:
         """Whether we should create a challenge."""
@@ -57,9 +205,12 @@ class Matchmaking:
         challenge_expired = self.last_challenge_created_delay.is_expired() and self.challenge_id
         min_wait_time_passed = self.last_challenge_created_delay.time_since_reset() > self.min_wait_time
         if challenge_expired:
-            self.li.cancel(self.challenge_id)
-            logger.info(f"Challenge id {self.challenge_id} cancelled.")
-            self.discard_challenge(self.challenge_id)
+            challenge_id = self.challenge_id
+            self.li.cancel(challenge_id)
+            logger.info(f"Challenge id {challenge_id} cancelled.")
+            self.discard_challenge(challenge_id)
+            if self.slots:
+                self.slots.release(challenge_id)
             self.show_earliest_challenge_time()
         return bool(matchmaking_enabled and (time_has_passed or challenge_expired) and min_wait_time_passed)
 
@@ -144,7 +295,7 @@ class Matchmaking:
             weights = [1] * len(online_bots)
         return weights
 
-    def choose_opponent(self) -> tuple[str | None, int, int, int, str, str]:
+    def choose_opponent(self, allowed_bot_lanes: set[str] | None = None) -> tuple[str | None, int, int, int, str, str]:
         """Choose an opponent."""
         override_choice = random.choice(self.matchmaking_cfg.overrides.keys() + [None])
         logger.info(f"Using the {override_choice or 'default'} matchmaking configuration.")
@@ -155,16 +306,12 @@ class Matchmaking:
         mode = self.get_random_config_value(match_config, "challenge_mode", ["casual", "rated"])
         rating_preference = match_config.rating_preference
 
-        base_time = random.choice(match_config.challenge_initial_time)
-        increment = random.choice(match_config.challenge_increment)
-        num_days = random.choice(match_config.challenge_days)
+        candidate_time_controls = configured_time_controls(match_config, allowed_bot_lanes)
+        if not candidate_time_controls:
+            logger.error("No valid time controls are available for matchmaking with the current settings.")
+            return None, 0, 0, 0, variant, mode
 
-        play_correspondence = [bool(num_days), not bool(base_time or increment)]
-        if random.choice(play_correspondence):
-            base_time = 0
-            increment = 0
-        else:
-            num_days = 0
+        base_time, increment, num_days = random.choice(candidate_time_controls)
 
         game_type = game_category(variant, base_time, increment, num_days)
 
@@ -232,13 +379,26 @@ class Matchmaking:
                 or not self.should_create_challenge()):
             return
 
+        allowed_bot_lanes = self.slots.available_bot_lanes(active_games) if self.slots else {"short", "long"}
+        if not allowed_bot_lanes:
+            return
+
         logger.info("Challenging a random bot")
         self.update_user_profile()
-        bot_username, base_time, increment, days, variant, mode = self.choose_opponent()
+        bot_username, base_time, increment, days, variant, mode = self.choose_opponent(allowed_bot_lanes)
+        if not bot_username:
+            return
+
+        challenge_speed = game_category("standard", base_time, increment, days)
+        if self.slots and not self.slots.can_accept_bot_speed(challenge_speed, active_games):
+            return
+
         logger.info(f"Will challenge {bot_username} for a {variant} game.")
-        challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode) if bot_username else ""
+        challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode)
         logger.info(f"Challenge id is {challenge_id or 'None'}.")
         self.challenge_id = challenge_id
+        if challenge_id and self.slots:
+            self.slots.reserve_outgoing_challenge(challenge_id, challenge_speed)
 
     def discard_challenge(self, challenge_id: str) -> None:
         """
@@ -299,7 +459,10 @@ class Matchmaking:
 
         Otherwise, we would attempt to cancel the challenge later.
         """
-        self.discard_challenge(event["game"]["id"])
+        game_id = event["game"]["id"]
+        self.discard_challenge(game_id)
+        if self.slots:
+            self.slots.confirm_game_start(game_id)
 
     def declined_challenge(self, event: EventType) -> None:
         """
@@ -312,6 +475,8 @@ class Matchmaking:
         reason = event["challenge"]["declineReason"]
         logger.info(f"{opponent} declined {challenge}: {reason}")
         self.discard_challenge(challenge.id)
+        if challenge.from_self and self.slots:
+            self.slots.release(challenge.id)
         if not challenge.from_self or self.challenge_filter == FilterType.NONE:
             return
 
