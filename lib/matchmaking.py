@@ -3,6 +3,7 @@ import random
 import logging
 import datetime
 import contextlib
+import math
 from dataclasses import dataclass, field
 from lib import model
 from lib.timer import Timer, days, seconds, minutes, years
@@ -18,7 +19,8 @@ MULTIPROCESSING_LIST_TYPE: TypeAlias = Sequence[model.Challenge]
 logger = logging.getLogger(__name__)
 
 BOT_SHORT_SPEEDS = {"ultraBullet", "bullet", "blitz"}
-BOT_LONG_SPEEDS = {"rapid", "classical", "correspondence"}
+BOT_LONG_SPEEDS = {"rapid", "classical"}
+CORRESPONDENCE_SPEED = "correspondence"
 
 
 def bot_lane_for_speed(speed: str) -> str:
@@ -26,8 +28,15 @@ def bot_lane_for_speed(speed: str) -> str:
     return "short" if speed in BOT_SHORT_SPEEDS else "long"
 
 
+def is_correspondence_speed(speed: str) -> bool:
+    """Whether a speed belongs to the correspondence lane."""
+    return speed == CORRESPONDENCE_SPEED
+
+
 def configured_time_controls(match_config: Configuration,
-                             allowed_bot_lanes: set[str] | None = None) -> list[tuple[int, int, int]]:
+                             allowed_bot_lanes: set[str] | None = None,
+                             *,
+                             include_correspondence: bool = True) -> list[tuple[int, int, int]]:
     """Get all configured time controls as (base_time, increment, days)."""
     challenge_initial_time: list[int | None] = list(match_config.challenge_initial_time or [None])
     challenge_increment: list[int | None] = list(match_config.challenge_increment or [None])
@@ -46,12 +55,13 @@ def configured_time_controls(match_config: Configuration,
             if allowed_bot_lanes is None or bot_lane_for_speed(speed) in allowed_bot_lanes:
                 time_controls.append((base_time, inc_time, 0))
 
-    for num_days_cfg in challenge_days:
-        num_days = int(num_days_cfg or 0)
-        if not num_days:
-            continue
-        if allowed_bot_lanes is None or "long" in allowed_bot_lanes:
-            time_controls.append((0, 0, num_days))
+    if include_correspondence:
+        for num_days_cfg in challenge_days:
+            num_days = int(num_days_cfg or 0)
+            if not num_days:
+                continue
+            if allowed_bot_lanes is None or "long" in allowed_bot_lanes:
+                time_controls.append((0, 0, num_days))
 
     return time_controls
 
@@ -63,11 +73,14 @@ class MatchmakingSlots:
     enabled: bool = field(init=False)
     slot_by_game_id: dict[str, str] = field(init=False, default_factory=dict)
     pending_outgoing_challenges: set[str] = field(init=False, default_factory=set)
+    pending_outgoing_correspondence: set[str] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
         self.enabled = self.max_games == 3
 
     def _slot_for_game(self, is_bot_game: bool, speed: str) -> str:
+        if is_correspondence_speed(speed):
+            return CORRESPONDENCE_SPEED
         if not self.enabled:
             return "any"
         if not is_bot_game:
@@ -80,25 +93,31 @@ class MatchmakingSlots:
             return
         self.slot_by_game_id[game_id] = self._slot_for_game(is_bot_game, speed)
         self.pending_outgoing_challenges.discard(game_id)
+        self.pending_outgoing_correspondence.discard(game_id)
 
     def reserve_outgoing_challenge(self, challenge_id: str, speed: str) -> None:
         """Reserve a lane for an outgoing challenge until it is accepted/declined/cancelled."""
         if not self.enabled:
             return
         self.slot_by_game_id[challenge_id] = self._slot_for_game(True, speed)
-        self.pending_outgoing_challenges.add(challenge_id)
+        if is_correspondence_speed(speed):
+            self.pending_outgoing_correspondence.add(challenge_id)
+        else:
+            self.pending_outgoing_challenges.add(challenge_id)
 
     def confirm_game_start(self, game_id: str) -> None:
         """Convert a pending outgoing challenge reservation into an active game reservation."""
         if not self.enabled:
             return
         self.pending_outgoing_challenges.discard(game_id)
+        self.pending_outgoing_correspondence.discard(game_id)
 
     def release(self, game_or_challenge_id: str) -> None:
         """Free a lane when a game ends or a challenge does not lead to a game."""
         if not self.enabled:
             return
         self.pending_outgoing_challenges.discard(game_or_challenge_id)
+        self.pending_outgoing_correspondence.discard(game_or_challenge_id)
         self.slot_by_game_id.pop(game_or_challenge_id, None)
 
     def has_reservation(self, game_id: str) -> bool:
@@ -114,6 +133,28 @@ class MatchmakingSlots:
         pending = sum(1 for challenge_id in self.pending_outgoing_challenges if challenge_id not in active_games)
         return len(active_games) + pending
 
+    def has_correspondence_reservation(self) -> bool:
+        """Whether we already have a correspondence game/challenge in progress."""
+        if not self.enabled:
+            return False
+        return any(slot == CORRESPONDENCE_SPEED for slot in self.slot_by_game_id.values())
+
+    def needs_correspondence_game(self) -> bool:
+        """Whether matchmaking should look for a correspondence game."""
+        return self.enabled and not self.has_correspondence_reservation()
+
+    def correspondence_reservation_count(self) -> int:
+        """Number of tracked correspondence games/challenges."""
+        if not self.enabled:
+            return 0
+        return sum(1 for slot in self.slot_by_game_id.values() if slot == CORRESPONDENCE_SPEED)
+
+    def is_correspondence(self, game_or_challenge_id: str) -> bool:
+        """Whether a tracked id belongs to the correspondence lane."""
+        if not self.enabled:
+            return False
+        return self.slot_by_game_id.get(game_or_challenge_id) == CORRESPONDENCE_SPEED
+
     def _bot_lane_counts(self) -> tuple[int, int]:
         if not self.enabled:
             return 0, 0
@@ -125,8 +166,16 @@ class MatchmakingSlots:
         """Whether a human challenge can be accepted now."""
         return self.used_slots(active_games) < self.max_games
 
+    def can_accept_correspondence(self, active_games: set[str]) -> bool:
+        """Whether a correspondence challenge can be accepted now."""
+        if not self.enabled:
+            return self.used_slots(active_games) < self.max_games
+        return True
+
     def can_accept_bot_speed(self, speed: str, active_games: set[str]) -> bool:
         """Whether a bot challenge with this speed can be accepted now."""
+        if is_correspondence_speed(speed):
+            return self.can_accept_correspondence(active_games)
         if self.used_slots(active_games) >= self.max_games:
             return False
         if not self.enabled:
@@ -139,6 +188,8 @@ class MatchmakingSlots:
 
     def can_accept_challenge(self, challenge: model.Challenge, active_games: set[str]) -> bool:
         """Whether an incoming challenge fits the slot policy."""
+        if is_correspondence_speed(challenge.speed):
+            return self.can_accept_correspondence(active_games)
         if challenge.challenger.is_bot:
             return self.can_accept_bot_speed(challenge.speed, active_games)
         return self.can_accept_human(active_games)
@@ -159,6 +210,14 @@ class MatchmakingSlots:
             available_lanes.add("long")
         return available_lanes
 
+    def can_start_correspondence_move(self, active_games: set[str]) -> bool:
+        """Whether a correspondence move may use a core right now."""
+        if self.used_slots(active_games) >= self.max_games:
+            return False
+        if not self.enabled:
+            return True
+        return bool(self.available_bot_lanes(active_games))
+
 
 class Matchmaking:
     """Challenge other bots."""
@@ -178,6 +237,8 @@ class Matchmaking:
         # Maximum time between challenges, even if there are active games
         self.max_wait_time = minutes(10) if self.matchmaking_cfg.allow_during_games else years(10)
         self.challenge_id = ""
+        self.force_immediate_challenge = False
+        self.max_background_correspondence_games = self._parse_max_background_correspondence_games()
 
         # (opponent name, game aspect) --> other bot is likely to accept challenge
         # game aspect is the one the challenged bot objects to and is one of:
@@ -198,12 +259,26 @@ class Matchmaking:
         """Attach the shared slot tracker used by matchmaking and challenge acceptance."""
         self.slots = slots
 
-    def should_create_challenge(self) -> bool:
+    def _parse_max_background_correspondence_games(self) -> int | float:
+        """Read and normalize the outgoing correspondence target."""
+        value = self.matchmaking_cfg.lookup("max_background_correspondence_games")
+        if value is None:
+            return 1
+        if value == math.inf:
+            return math.inf
+        with contextlib.suppress(Exception):
+            parsed_value = int(value)
+            return max(0, parsed_value)
+        return 1
+
+    def should_create_challenge(self, *, ignore_postgame_timeout: bool = False,
+                                ignore_min_wait: bool = False) -> bool:
         """Whether we should create a challenge."""
         matchmaking_enabled = self.matchmaking_cfg.allow_matchmaking
-        time_has_passed = self.last_game_ended_delay.is_expired() and self.rate_limit_timer.is_expired()
+        postgame_ok = ignore_postgame_timeout or self.last_game_ended_delay.is_expired()
+        time_has_passed = postgame_ok and self.rate_limit_timer.is_expired()
         challenge_expired = self.last_challenge_created_delay.is_expired() and self.challenge_id
-        min_wait_time_passed = self.last_challenge_created_delay.time_since_reset() > self.min_wait_time
+        min_wait_time_passed = ignore_min_wait or self.last_challenge_created_delay.time_since_reset() > self.min_wait_time
         if challenge_expired:
             challenge_id = self.challenge_id
             self.li.cancel(challenge_id)
@@ -295,7 +370,8 @@ class Matchmaking:
             weights = [1] * len(online_bots)
         return weights
 
-    def choose_opponent(self, allowed_bot_lanes: set[str] | None = None) -> tuple[str | None, int, int, int, str, str]:
+    def choose_opponent(self, allowed_bot_lanes: set[str] | None = None,
+                        *, correspondence_only: bool = False) -> tuple[str | None, int, int, int, str, str]:
         """Choose an opponent."""
         override_choice = random.choice(self.matchmaking_cfg.overrides.keys() + [None])
         logger.info(f"Using the {override_choice or 'default'} matchmaking configuration.")
@@ -306,7 +382,13 @@ class Matchmaking:
         mode = self.get_random_config_value(match_config, "challenge_mode", ["casual", "rated"])
         rating_preference = match_config.rating_preference
 
-        candidate_time_controls = configured_time_controls(match_config, allowed_bot_lanes)
+        candidate_time_controls = configured_time_controls(match_config,
+                                                           allowed_bot_lanes,
+                                                           include_correspondence=correspondence_only)
+        if correspondence_only:
+            candidate_time_controls = [control for control in candidate_time_controls if control[2] > 0]
+        else:
+            candidate_time_controls = [control for control in candidate_time_controls if control[2] == 0]
         if not candidate_time_controls:
             logger.error("No valid time controls are available for matchmaking with the current settings.")
             return None, 0, 0, 0, variant, mode
@@ -372,26 +454,63 @@ class Matchmaking:
         :param challenge_queue: The queue containing the challenges.
         :param max_games: The maximum allowed number of simultaneous games.
         """
+        if challenge_queue:
+            return
+
+        if self._challenge_for_background_correspondence(active_games):
+            return
+
         max_games_for_matchmaking = max_games if self.matchmaking_cfg.allow_during_games else min(1, max_games)
-        game_count = len(active_games) + len(challenge_queue)
-        if (game_count >= max_games_for_matchmaking
-                or (game_count > 0 and self.last_challenge_created_delay.time_since_reset() < self.max_wait_time)
-                or not self.should_create_challenge()):
+        game_count = len(active_games)
+        if game_count >= max_games_for_matchmaking:
             return
 
         allowed_bot_lanes = self.slots.available_bot_lanes(active_games) if self.slots else {"short", "long"}
         if not allowed_bot_lanes:
             return
 
+        cooldown_while_games_active = self.max_wait_time
+        if self.slots and self.slots.enabled:
+            # In slot mode (concurrency=3), fill the missing bot lane quickly.
+            cooldown_while_games_active = self.min_wait_time
+
+        if game_count > 0 and self.last_challenge_created_delay.time_since_reset() < cooldown_while_games_active:
+            return
+
+        if not self.should_create_challenge():
+            return
+
+        self.create_matchmaking_challenge(active_games, allowed_bot_lanes=allowed_bot_lanes)
+
+    def _challenge_for_background_correspondence(self, active_games: set[str]) -> bool:
+        """Ensure there is always one correspondence game in slot mode."""
+        if not (self.slots and self.slots.enabled):
+            return False
+
+        current_correspondence = self.slots.correspondence_reservation_count()
+        if current_correspondence >= self.max_background_correspondence_games:
+            return False
+        ignore_min_wait = self.force_immediate_challenge
+        self.force_immediate_challenge = False
+        if not self.should_create_challenge(ignore_postgame_timeout=True, ignore_min_wait=ignore_min_wait):
+            return False
+        return self.create_matchmaking_challenge(active_games, correspondence_only=True)
+
+    def create_matchmaking_challenge(self, active_games: set[str],
+                                     allowed_bot_lanes: set[str] | None = None,
+                                     *,
+                                     correspondence_only: bool = False) -> bool:
+        """Create one outgoing matchmaking challenge."""
         logger.info("Challenging a random bot")
         self.update_user_profile()
-        bot_username, base_time, increment, days, variant, mode = self.choose_opponent(allowed_bot_lanes)
+        bot_username, base_time, increment, days, variant, mode = self.choose_opponent(allowed_bot_lanes,
+                                                                                        correspondence_only=correspondence_only)
         if not bot_username:
-            return
+            return False
 
         challenge_speed = game_category("standard", base_time, increment, days)
         if self.slots and not self.slots.can_accept_bot_speed(challenge_speed, active_games):
-            return
+            return False
 
         logger.info(f"Will challenge {bot_username} for a {variant} game.")
         challenge_id = self.create_challenge(bot_username, base_time, increment, days, variant, mode)
@@ -399,6 +518,7 @@ class Matchmaking:
         self.challenge_id = challenge_id
         if challenge_id and self.slots:
             self.slots.reserve_outgoing_challenge(challenge_id, challenge_speed)
+        return bool(challenge_id)
 
     def discard_challenge(self, challenge_id: str) -> None:
         """
@@ -413,6 +533,10 @@ class Matchmaking:
         """Reset the timer for when the last game ended, and prints the earliest that the next challenge will be created."""
         self.last_game_ended_delay.reset()
         self.show_earliest_challenge_time()
+
+    def correspondence_game_done(self) -> None:
+        """Request that matchmaking immediately replaces a finished correspondence background game."""
+        self.force_immediate_challenge = True
 
     def show_earliest_challenge_time(self) -> None:
         """Show the earliest that the next challenge will be created."""

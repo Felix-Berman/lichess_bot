@@ -269,7 +269,244 @@ def test_matchmaking_slots__enforces_two_bot_lanes_when_concurrency_is_three() -
 
     slots.reserve_outgoing_challenge("long_pending", "rapid")
     assert slots.can_accept_bot_speed("rapid", active_games) is False
+    assert slots.can_accept_bot_speed("correspondence", active_games) is True
+
+    slots.reserve_outgoing_challenge("corr_pending", "correspondence")
+    assert slots.can_accept_bot_speed("correspondence", active_games) is True
     assert slots.can_accept_human(active_games) is True
 
     active_games.add("human_game")
     assert slots.can_accept_human(active_games) is False
+
+
+def test_matchmaking_slots__correspondence_move_uses_bot_lane_capacity() -> None:
+    """Test that correspondence moves only run when a short/long bot lane is available."""
+    slots = MatchmakingSlots(3)
+    active_games: set[str] = {"bot_short_game", "bot_long_game"}
+    slots.reserve_game("bot_short_game", is_bot_game=True, speed="bullet")
+    slots.reserve_game("bot_long_game", is_bot_game=True, speed="rapid")
+
+    # Human slot is still free (2/3 cores used), but both bot lanes are occupied.
+    assert slots.can_start_correspondence_move(active_games) is False
+
+    active_games.remove("bot_long_game")
+    slots.release("bot_long_game")
+    assert slots.can_start_correspondence_move(active_games) is True
+
+
+def test_matchmaking_challenge__fills_open_lane_quickly_in_slot_mode() -> None:
+    """Test that slot mode fills the missing short/long bot lane without the long active-game cooldown."""
+    li = Mock()
+    config = Configuration({
+        "challenge": {"variants": ["standard"]},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_timeout": 1,
+            "challenge_initial_time": [60, 600],
+            "challenge_increment": [0],
+            "challenge_days": [1],
+            "opponent_min_rating": 600,
+            "opponent_max_rating": 4000,
+            "opponent_rating_difference": None,
+            "rating_preference": "none",
+            "challenge_filter": "fine",
+            "block_list": [],
+            "online_block_list": [],
+            "overrides": {}
+        }
+    })
+    user_profile: UserProfileType = {"username": "test_bot", "perfs": {}}
+    matchmaking = Matchmaking(li, config, user_profile)
+    slots = MatchmakingSlots(3)
+    matchmaking.set_slots(slots)
+
+    active_games = {"long_game"}
+    slots.reserve_game("long_game", is_bot_game=True, speed="rapid")
+    slots.reserve_game("corr_game", is_bot_game=True, speed="correspondence")
+
+    matchmaking.should_create_challenge = Mock(return_value=True)  # type: ignore[method-assign]
+    matchmaking.update_user_profile = Mock()  # type: ignore[method-assign]
+    matchmaking.choose_opponent = Mock(return_value=("other_bot", 60, 0, 0, "standard", "rated"))  # type: ignore[method-assign]
+    matchmaking.create_challenge = Mock(return_value="new_short_lane")  # type: ignore[method-assign]
+
+    matchmaking.last_challenge_created_delay.reset()
+    matchmaking.last_challenge_created_delay.starting_time -= 120
+
+    matchmaking.challenge(active_games, [], 3)
+
+    matchmaking.choose_opponent.assert_called_once_with({"short"}, correspondence_only=False)
+    matchmaking.create_challenge.assert_called_once_with("other_bot", 60, 0, 0, "standard", "rated")
+
+
+def test_matchmaking_challenge__creates_correspondence_even_when_realtime_is_full() -> None:
+    """Test that slot mode still creates a correspondence challenge while all realtime cores are occupied."""
+    li = Mock()
+    config = Configuration({
+        "challenge": {"variants": ["standard"]},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_timeout": 1,
+            "challenge_initial_time": [60, 600],
+            "challenge_increment": [0],
+            "challenge_days": [1],
+            "opponent_min_rating": 600,
+            "opponent_max_rating": 4000,
+            "opponent_rating_difference": None,
+            "rating_preference": "none",
+            "challenge_filter": "fine",
+            "block_list": [],
+            "online_block_list": [],
+            "overrides": {}
+        }
+    })
+    user_profile: UserProfileType = {"username": "test_bot", "perfs": {}}
+    matchmaking = Matchmaking(li, config, user_profile)
+    slots = MatchmakingSlots(3)
+    matchmaking.set_slots(slots)
+
+    active_games = {"bot_short", "bot_long", "human"}
+    slots.reserve_game("bot_short", is_bot_game=True, speed="blitz")
+    slots.reserve_game("bot_long", is_bot_game=True, speed="rapid")
+    slots.reserve_game("human", is_bot_game=False, speed="blitz")
+
+    matchmaking.should_create_challenge = Mock(return_value=True)  # type: ignore[method-assign]
+    matchmaking.update_user_profile = Mock()  # type: ignore[method-assign]
+    matchmaking.choose_opponent = Mock(return_value=("other_bot", 0, 0, 1, "standard", "rated"))  # type: ignore[method-assign]
+    matchmaking.create_challenge = Mock(return_value="new_corr_lane")  # type: ignore[method-assign]
+
+    matchmaking.last_challenge_created_delay.reset()
+    matchmaking.last_challenge_created_delay.starting_time -= 120
+
+    matchmaking.challenge(active_games, [], 3)
+
+    matchmaking.choose_opponent.assert_called_once_with(None, correspondence_only=True)
+    matchmaking.create_challenge.assert_called_once_with("other_bot", 0, 0, 1, "standard", "rated")
+
+
+def test_matchmaking_challenge__respects_max_background_correspondence_games() -> None:
+    """Test that outgoing correspondence challenges stop at the configured target."""
+    li = Mock()
+    config = Configuration({
+        "challenge": {"variants": ["standard"]},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_timeout": 1,
+            "challenge_initial_time": [60],
+            "challenge_increment": [0],
+            "challenge_days": [1],
+            "max_background_correspondence_games": 2,
+            "opponent_min_rating": 600,
+            "opponent_max_rating": 4000,
+            "opponent_rating_difference": None,
+            "rating_preference": "none",
+            "challenge_filter": "fine",
+            "block_list": [],
+            "online_block_list": [],
+            "overrides": {}
+        }
+    })
+    user_profile: UserProfileType = {"username": "test_bot", "perfs": {}}
+    matchmaking = Matchmaking(li, config, user_profile)
+    slots = MatchmakingSlots(3)
+    matchmaking.set_slots(slots)
+
+    active_games = {"bot_short", "bot_long", "human"}
+    slots.reserve_game("bot_short", is_bot_game=True, speed="blitz")
+    slots.reserve_game("bot_long", is_bot_game=True, speed="rapid")
+    slots.reserve_game("human", is_bot_game=False, speed="blitz")
+    slots.reserve_game("corr_one", is_bot_game=True, speed="correspondence")
+    slots.reserve_game("corr_two", is_bot_game=True, speed="correspondence")
+
+    matchmaking.should_create_challenge = Mock(return_value=True)  # type: ignore[method-assign]
+    matchmaking.update_user_profile = Mock()  # type: ignore[method-assign]
+    matchmaking.choose_opponent = Mock(return_value=("other_bot", 0, 0, 1, "standard", "rated"))  # type: ignore[method-assign]
+
+    matchmaking.challenge(active_games, [], 3)
+
+    matchmaking.choose_opponent.assert_not_called()
+
+
+def test_matchmaking_challenge__can_force_immediate_correspondence_replacement() -> None:
+    """Test that a finished correspondence game can trigger an immediate replacement challenge."""
+    li = Mock()
+    config = Configuration({
+        "challenge": {"variants": ["standard"]},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_timeout": 1,
+            "challenge_initial_time": [60],
+            "challenge_increment": [0],
+            "challenge_days": [1],
+            "opponent_min_rating": 600,
+            "opponent_max_rating": 4000,
+            "opponent_rating_difference": None,
+            "rating_preference": "none",
+            "challenge_filter": "fine",
+            "block_list": [],
+            "online_block_list": [],
+            "overrides": {}
+        }
+    })
+    user_profile: UserProfileType = {"username": "test_bot", "perfs": {}}
+    matchmaking = Matchmaking(li, config, user_profile)
+    slots = MatchmakingSlots(3)
+    matchmaking.set_slots(slots)
+
+    matchmaking.should_create_challenge = Mock(return_value=True)  # type: ignore[method-assign]
+    matchmaking.create_matchmaking_challenge = Mock(return_value=True)  # type: ignore[method-assign]
+
+    matchmaking.correspondence_game_done()
+    matchmaking.challenge({"bot_short", "bot_long", "human"}, [], 3)
+
+    matchmaking.should_create_challenge.assert_called_once_with(ignore_postgame_timeout=True, ignore_min_wait=True)
+
+
+def test_matchmaking_challenge__keeps_long_cooldown_without_slot_mode() -> None:
+    """Test that non-slot mode still waits up to max_wait_time between active-game challenges."""
+    li = Mock()
+    config = Configuration({
+        "challenge": {"variants": ["standard"]},
+        "matchmaking": {
+            "allow_matchmaking": True,
+            "allow_during_games": True,
+            "challenge_variant": "standard",
+            "challenge_mode": "rated",
+            "challenge_timeout": 1,
+            "challenge_initial_time": [60, 600],
+            "challenge_increment": [0],
+            "challenge_days": [],
+            "opponent_min_rating": 600,
+            "opponent_max_rating": 4000,
+            "opponent_rating_difference": None,
+            "rating_preference": "none",
+            "challenge_filter": "fine",
+            "block_list": [],
+            "online_block_list": [],
+            "overrides": {}
+        }
+    })
+    user_profile: UserProfileType = {"username": "test_bot", "perfs": {}}
+    matchmaking = Matchmaking(li, config, user_profile)
+
+    matchmaking.should_create_challenge = Mock(return_value=True)  # type: ignore[method-assign]
+    matchmaking.update_user_profile = Mock()  # type: ignore[method-assign]
+    matchmaking.choose_opponent = Mock(return_value=("other_bot", 60, 0, 0, "standard", "rated"))  # type: ignore[method-assign]
+
+    matchmaking.last_challenge_created_delay.reset()
+    matchmaking.last_challenge_created_delay.starting_time -= 120
+
+    matchmaking.challenge({"active_game"}, [], 3)
+
+    matchmaking.choose_opponent.assert_not_called()

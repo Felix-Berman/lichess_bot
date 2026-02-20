@@ -373,8 +373,6 @@ def lichess_bot_main(li: lichess.Lichess,
     if slots.enabled:
         for game in all_games:
             game_id = game["gameId"]
-            if game_id not in active_games:
-                continue
             speed = game.get("speed", "rapid")
             is_bot = game_is_bot_opponent(li, game)
             slots.reserve_game(game_id, is_bot, speed)
@@ -396,11 +394,18 @@ def lichess_bot_main(li: lichess.Lichess,
                 break
 
             if event["type"] == "local_game_done":
-                active_games.discard(event["game"]["id"])
-                slots.release(event["game"]["id"])
-                matchmaker.game_done()
+                game_id = event["game"]["id"]
+                active_games.discard(game_id)
+                is_correspondence = slots.is_correspondence(game_id)
+                if not is_correspondence:
+                    slots.release(game_id)
+                    matchmaker.game_done()
+                elif not game_is_active(li, game_id):
+                    # The correspondence game has actually ended (not just disconnected between moves).
+                    slots.release(game_id)
+                    matchmaker.correspondence_game_done()
                 log_proc_count("Freed", active_games)
-                one_game_completed = True
+                one_game_completed = one_game_completed or not is_correspondence
             elif event["type"] == "challenge":
                 handle_challenge(event,
                                  li,
@@ -417,6 +422,12 @@ def lichess_bot_main(li: lichess.Lichess,
                 log_proc_count("Freed", active_games)
             elif event["type"] == "gameStart":
                 matchmaker.accepted_challenge(event)
+                game = event["game"]
+                game_id = game["id"]
+                if slots.enabled and not slots.has_reservation(game_id):
+                    speed = game.get("speed", "rapid")
+                    is_bot = game_is_bot_opponent(li, game)
+                    slots.reserve_game(game_id, is_bot, speed)
                 start_game(event,
                            pool,
                            play_game_args,
@@ -424,16 +435,18 @@ def lichess_bot_main(li: lichess.Lichess,
                            startup_correspondence_games,
                            correspondence_queue,
                            active_games,
-                           low_time_games)
+                           low_time_games,
+                           slots)
 
-            start_low_time_games(low_time_games, active_games, max_games, pool, play_game_args)
+            start_low_time_games(low_time_games, active_games, max_games, pool, play_game_args, slots)
             check_in_on_correspondence_games(pool,
                                              event,
                                              correspondence_queue,
                                              challenge_queue,
                                              play_game_args,
                                              active_games,
-                                             max_games)
+                                             max_games,
+                                             slots)
             accept_challenges(li, challenge_queue, active_games, max_games, slots)
             matchmaker.challenge(active_games, challenge_queue, max_games)
             check_online_status(li, user_profile, last_check_online_time)
@@ -482,7 +495,8 @@ def check_in_on_correspondence_games(pool: POOL_TYPE,
                                      challenge_queue: MULTIPROCESSING_LIST_TYPE,
                                      play_game_args: PlayGameArgsType,
                                      active_games: set[str],
-                                     max_games: int) -> None:
+                                     max_games: int,
+                                     slots: matchmaking.MatchmakingSlots) -> None:
     """Start correspondence games."""
     global correspondence_games_to_start
 
@@ -494,7 +508,12 @@ def check_in_on_correspondence_games(pool: POOL_TYPE,
     if challenge_queue:
         return
 
-    while len(active_games) < max_games and correspondence_games_to_start > 0:
+    def can_start_correspondence() -> bool:
+        if slots.enabled:
+            return slots.can_start_correspondence_move(active_games)
+        return len(active_games) < max_games
+
+    while can_start_correspondence() and correspondence_games_to_start > 0:
         game_id = correspondence_queue.get_nowait()
         correspondence_games_to_start -= 1
         correspondence_queue.task_done()
@@ -502,10 +521,14 @@ def check_in_on_correspondence_games(pool: POOL_TYPE,
 
 
 def start_low_time_games(low_time_games: list[GameType], active_games: set[str], max_games: int,
-                         pool: POOL_TYPE, play_game_args: PlayGameArgsType) -> None:
+                         pool: POOL_TYPE, play_game_args: PlayGameArgsType,
+                         slots: matchmaking.MatchmakingSlots) -> None:
     """Start the games based on how much time we have left."""
     low_time_games.sort(key=lambda g: g.get("secondsLeft", math.inf))
     while low_time_games and len(active_games) < max_games:
+        next_game = low_time_games[0]
+        if slots.enabled and next_game.get("speed") == "correspondence" and not slots.can_start_correspondence_move(active_games):
+            break
         game_id = low_time_games.pop(0)["id"]
         start_game_thread(active_games, game_id, play_game_args, pool)
 
@@ -522,11 +545,6 @@ def accept_challenges(li: lichess.Lichess,
         return len(active_games) < max_games
 
     while challenge_queue:
-        if slots.enabled and slots.used_slots(active_games) >= max_games:
-            break
-        if not slots.enabled and len(active_games) >= max_games:
-            break
-
         human_challenge_index = next((index
                                       for index, challenge in enumerate(challenge_queue)
                                       if not challenge.challenger.is_bot and can_accept_now(challenge)), None)
@@ -545,9 +563,13 @@ def accept_challenges(li: lichess.Lichess,
         try:
             logger.info(f"Accept {chlng}")
             li.accept_challenge(chlng.id)
-            active_games.add(chlng.id)
             slots.reserve_game(chlng.id, chlng.challenger.is_bot, chlng.speed)
-            log_proc_count("Queued", active_games)
+            uses_core = not (slots.enabled and chlng.speed == "correspondence")
+            if uses_core:
+                active_games.add(chlng.id)
+                log_proc_count("Queued", active_games)
+            else:
+                logger.info(f"Queued correspondence game in background lane: {chlng.id}")
         except (HTTPError, ReadTimeout) as exception:
             if isinstance(exception, HTTPError) and exception.response is not None and exception.response.status_code == 404:
                 logger.info(f"Skip missing {chlng}")
@@ -633,7 +655,8 @@ def start_game(event: EventType,
                startup_correspondence_games: list[str],
                correspondence_queue: CORRESPONDENCE_QUEUE_TYPE,
                active_games: set[str],
-               low_time_games: list[GameType]) -> None:
+               low_time_games: list[GameType],
+               slots: matchmaking.MatchmakingSlots) -> None:
     """
     Start a game.
 
@@ -645,18 +668,24 @@ def start_game(event: EventType,
     :param correspondence_queue: The queue that correspondence games are added to, to be started.
     :param active_games: A set of all the games that aren't correspondence games.
     :param low_time_games: A list of games, in which we don't have much time remaining.
+    :param slots: Slot tracker used for correspondence-aware scheduling.
     """
     game_id = event["game"]["id"]
-    if game_id in startup_correspondence_games:
+    is_correspondence = event["game"].get("speed") == "correspondence" or slots.is_correspondence(game_id)
+    if is_correspondence:
         if enough_time_to_queue(event, config):
             logger.info(f"--- Enqueue {config.url + game_id}")
             correspondence_queue.put_nowait(game_id)
         else:
             logger.info(f"--- Will start {config.url + game_id} as soon as possible")
             low_time_games.append(event["game"])
+        if game_id in startup_correspondence_games:
+            startup_correspondence_games.remove(game_id)
+        return
+
+    if game_id in startup_correspondence_games:
         startup_correspondence_games.remove(game_id)
-    else:
-        start_game_thread(active_games, game_id, play_game_args, pool)
+    start_game_thread(active_games, game_id, play_game_args, pool)
 
 
 def enough_time_to_queue(event: EventType, config: Configuration) -> bool:

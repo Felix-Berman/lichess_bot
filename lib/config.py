@@ -236,6 +236,7 @@ def insert_default_values(CONFIG: CONFIG_DICT_TYPE) -> None:
     change_value_to_list(CONFIG, "matchmaking", key="challenge_increment")
     set_config_default(CONFIG, "matchmaking", key="challenge_days", default=[None], force_empty_values=True)
     change_value_to_list(CONFIG, "matchmaking", key="challenge_days")
+    set_config_default(CONFIG, "matchmaking", key="max_background_correspondence_games", default=1, force_empty_values=True)
     set_config_default(CONFIG, "matchmaking", key="opponent_min_rating", default=600, force_empty_values=True)
     set_config_default(CONFIG, "matchmaking", key="opponent_max_rating", default=4000, force_empty_values=True)
     set_config_default(CONFIG, "matchmaking", key="rating_preference", default="none")
@@ -326,6 +327,12 @@ def validate_config(CONFIG: CONFIG_DICT_TYPE) -> None:
 
     matchmaking = CONFIG["matchmaking"]
     matchmaking_enabled = matchmaking["allow_matchmaking"]
+    max_background_correspondence = matchmaking.get("max_background_correspondence_games")
+    is_valid_background_target = (max_background_correspondence == math.inf
+                                  or (isinstance(max_background_correspondence, (int, float))
+                                      and max_background_correspondence >= 0))
+    config_assert(is_valid_background_target,
+                  "`matchmaking:max_background_correspondence_games` must be a non-negative number or .inf.")
 
     if matchmaking_enabled:
         config_warn(matchmaking["opponent_min_rating"] <= matchmaking["opponent_max_rating"],

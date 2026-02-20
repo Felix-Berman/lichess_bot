@@ -12,6 +12,7 @@ import datetime
 import time
 import random
 import math
+import re
 import contextlib
 from collections import Counter
 from collections.abc import Callable
@@ -30,6 +31,31 @@ from types import TracebackType
 logger = logging.getLogger(__name__)
 
 out_of_online_opening_book_moves: Counter[str] = Counter()
+
+
+def patch_python_chess_uci_score_parser() -> None:
+    """Allow bound score tokens before score kind (e.g. 'score lowerbound cp 42')."""
+    if getattr(chess.engine, "_lichess_bot_bound_score_patch", False):
+        return
+
+    parser = getattr(chess.engine, "_parse_uci_info", None)
+    if parser is None:
+        return
+
+    bound_score_pattern = re.compile(r"(?<!\S)score\s+(lowerbound|upperbound)\s+(cp|mate)\s+(-?\d+)")
+
+    def patched_parse_uci_info(arg: str, root_board: chess.Board, selector: chess.engine.Info) -> chess.engine.InfoDict:
+        normalized = bound_score_pattern.sub(
+            lambda match: f"score {match.group(2)} {match.group(3)} {match.group(1)}",
+            arg
+        )
+        return parser(normalized, root_board, selector)
+
+    chess.engine._parse_uci_info = patched_parse_uci_info
+    chess.engine._lichess_bot_bound_score_patch = True
+
+
+patch_python_chess_uci_score_parser()
 
 
 def create_engine(engine_config: Configuration, game: model.Game | None = None) -> EngineWrapper:

@@ -57,3 +57,20 @@ def test_accept_challenges__keeps_one_short_and_one_long_bot_slot() -> None:
     accepted_ids = [call.args[0] for call in li.accept_challenge.call_args_list]
     assert accepted_ids == ["bot_long_one", "bot_short"]
     assert [challenge.id for challenge in challenge_queue] == ["bot_long_two"]
+
+
+def test_accept_challenges__accepts_background_correspondence_when_cores_are_full() -> None:
+    """Test that correspondence can be accepted even when all realtime cores are occupied."""
+    li = Mock()
+    challenge_queue = [FakeChallenge("corr", is_bot=True, speed="correspondence")]
+    active_games = {"bot_short", "bot_long", "human"}
+    slots = MatchmakingSlots(3)
+    slots.reserve_game("bot_short", is_bot_game=True, speed="blitz")
+    slots.reserve_game("bot_long", is_bot_game=True, speed="rapid")
+    slots.reserve_game("human", is_bot_game=False, speed="blitz")
+
+    lichess_bot.accept_challenges(li, challenge_queue, active_games, 3, slots)
+
+    accepted_ids = [call.args[0] for call in li.accept_challenge.call_args_list]
+    assert accepted_ids == ["corr"]
+    assert active_games == {"bot_short", "bot_long", "human"}
